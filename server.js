@@ -1,0 +1,241 @@
+const express = require('express');
+const axios = require('axios');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+const app = express();
+
+// ============================================================
+//  CONFIGURATION – FILL THESE WITH YOUR LIVE DATA NOW
+// ============================================================
+const CONFIG = {
+  paystack: {
+    secretKey: 'sk_test_0ec25e0aae7c4901893d09527c5fe1437f3d1e20', // REPLACE WITH YOUR LIVE SECRET KEY
+    publicKey: 'pk_test_64e5c61addf7aa21b2c4a168ee1428ee46d9c9f1', // REPLACE WITH YOUR LIVE PUBLIC KEY
+    storefrontUrl: 'https://paystack.shop/gregorian-store', // REPLACE WITH YOUR LIVE STOREFRONT URL
+  },
+  email: {
+    alertTo: 'getontodara@gmail.com', // YOUR EMAIL
+    smtpHost: 'smtp.gmail.com',
+    smtpPort: 587,
+    smtpUser: 'getontodara@gmail.com', // REPLACE WITH YOUR BUSINESS GMAIL
+    smtpPass: 'mfea dnlx nisq yydz', // REPLACE WITH YOUR GMAIL APP PASSWORD
+  },
+  admin: {
+    apiKey: 'my-ship-admin-key-2026', // CHANGE THIS TO A SECURE STRING
+  }
+};
+
+// ============================================================
+//  MIDDLEWARE – Capture raw body for webhook signature
+// ============================================================
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+
+// ============================================================
+//  EMAIL TRANSPORTER
+// ============================================================
+const transporter = nodemailer.createTransport({
+  host: CONFIG.email.smtpHost,
+  port: CONFIG.email.smtpPort,
+  secure: false,
+  auth: {
+    user: CONFIG.email.smtpUser,
+    pass: CONFIG.email.smtpPass,
+  }
+});
+
+// ============================================================
+//  IN-MEMORY DATABASE (replace with PostgreSQL later)
+// ============================================================
+const orders = new Map();
+
+// ============================================================
+//  PAYSTACK WEBHOOK ENDPOINT
+// ============================================================
+app.post('/paystack-webhook', async (req, res) => {
+  try {
+    const event = req.body;
+
+    // Verify webhook signature (CRITICAL FOR SECURITY)
+    const hash = crypto
+      .createHmac('sha512', CONFIG.paystack.secretKey)
+      .update(req.rawBody)
+      .digest('hex');
+    if (hash !== req.headers['x-paystack-signature']) {
+      return res.status(401).send('Unauthorized');
+    }
+
+    if (event.event === 'charge.success') {
+      const data = event.data;
+      const orderId = data.metadata?.order_id || `ORD-${Date.now()}`;
+      
+      // Build order object with safe fallbacks
+      const order = {
+        id: orderId,
+        customer: {
+          name: data.metadata?.customer_name || data.customer?.first_name || 'Customer',
+          email: data.customer?.email || 'customer@example.com',
+          phone: data.metadata?.phone || '08000000000',
+          address: data.metadata?.address || 'No address provided',
+          city: data.metadata?.city || 'Lagos',
+          state: data.metadata?.state || 'Lagos',
+        },
+        product: {
+          name: data.metadata?.product_name || 'Product',
+          link: data.metadata?.product_link || '#',
+          quantity: data.metadata?.quantity || 1,
+          price: data.amount / 100,
+        },
+        status: 'pending_purchase',
+        tracking: null,
+        courier: null,
+        createdAt: new Date(),
+      };
+      orders.set(orderId, order);
+
+      // 1. Send alert email to partner (you)
+      await sendPartnerAlert(order);
+
+      // 2. Send confirmation email to customer
+      await sendCustomerConfirmation(order);
+
+      res.status(200).send('OK');
+    } else {
+      res.status(200).send('Event ignored');
+    }
+  } catch (error) {
+    console.error('Webhook error:', error);
+    res.status(500).send('Internal server error');
+  }
+});
+
+// ============================================================
+//  ADMIN: UPDATE TRACKING (requires API key)
+// ============================================================
+app.post('/admin/update-tracking', express.json(), async (req, res) => {
+  const { orderId, trackingNumber, courier, apiKey } = req.body;
+  
+  // Simple auth check
+  if (apiKey !== CONFIG.admin.apiKey) {
+    return res.status(401).json({ error: 'Invalid API key' });
+  }
+
+  const order = orders.get(orderId);
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  order.tracking = trackingNumber;
+  order.courier = courier || 'Standard Shipping';
+  order.status = 'shipped';
+  orders.set(orderId, order);
+
+  // Send tracking update to customer
+  await sendCustomerTracking(order);
+
+  res.json({ success: true, message: 'Tracking updated & customer notified' });
+});
+
+// ============================================================
+//  ADMIN: GET ALL ORDERS (for your dashboard)
+// ============================================================
+app.get('/admin/orders', (req, res) => {
+  const allOrders = Array.from(orders.values());
+  res.json(allOrders);
+});
+
+// ============================================================
+//  EMAIL FUNCTIONS
+// ============================================================
+
+async function sendPartnerAlert(order) {
+  try {
+    const mailOptions = {
+      from: `"Dropshipping Bot" <${CONFIG.email.smtpUser}>`,
+      to: CONFIG.email.alertTo,
+      subject: `🔔 ACTION REQUIRED: Buy on AliExpress - Order #${order.id}`,
+      html: `
+        <h2>New Dropship Order #${order.id}</h2>
+        <p><strong>Customer:</strong> ${order.customer.name}</p>
+        <p><strong>Phone:</strong> ${order.customer.phone}</p>
+        <p><strong>Address:</strong> ${order.customer.address}, ${order.customer.city}, ${order.customer.state}</p>
+        <p><strong>Product:</strong> ${order.product.name}</p>
+        <p><strong>Link:</strong> <a href="${order.product.link}">${order.product.link}</a></p>
+        <p><strong>Quantity:</strong> ${order.product.quantity}</p>
+        <p><strong>Price Paid:</strong> ₦${order.product.price}</p>
+        <hr>
+        <h3>NEXT STEP:</h3>
+        <ol>
+          <li>Click the product link above.</li>
+          <li>Buy it on AliExpress using the customer's address.</li>
+          <li>Get the tracking number.</li>
+          <li>Go to your admin dashboard and update tracking.</li>
+        </ol>
+      `
+    };
+    await transporter.sendMail(mailOptions);
+    console.log(`Partner alert sent for order ${order.id}`);
+  } catch (error) {
+    console.error('Failed to send partner alert:', error);
+  }
+}
+
+async function sendCustomerConfirmation(order) {
+  try {
+    const mailOptions = {
+      from: `"Your Business" <${CONFIG.email.smtpUser}>`,
+      to: order.customer.email,
+      subject: `Order Confirmation #${order.id}`,
+      html: `
+        <h2>Thank you for your order!</h2>
+        <p>Dear ${order.customer.name},</p>
+        <p>We have received your order <strong>#${order.id}</strong> and are processing it.</p>
+        <p><strong>Product:</strong> ${order.product.name}</p>
+        <p><strong>Quantity:</strong> ${order.product.quantity}</p>
+        <p><strong>Total:</strong> ₦${order.product.price}</p>
+        <p>You will receive a tracking number within 24-48 hours.</p>
+        <p>Thank you for shopping with us!</p>
+      `
+    };
+    await transporter.sendMail(mailOptions);
+    console.log(`Confirmation sent to ${order.customer.email}`);
+  } catch (error) {
+    console.error('Failed to send customer confirmation:', error);
+  }
+}
+
+async function sendCustomerTracking(order) {
+  try {
+    const trackingLink = order.tracking 
+      ? `<a href="https://www.17track.net/en?nums=${order.tracking}">Click to Track</a>`
+      : 'Tracking number will be updated soon.';
+
+    const mailOptions = {
+      from: `"Your Business" <${CONFIG.email.smtpUser}>`,
+      to: order.customer.email,
+      subject: `Your Order #${order.id} Has Been Shipped!`,
+      html: `
+        <h2>Your Order Has Been Shipped!</h2>
+        <p>Dear ${order.customer.name},</p>
+        <p>Your order <strong>#${order.id}</strong> is now on its way.</p>
+        <p><strong>Courier:</strong> ${order.courier}</p>
+        <p><strong>Tracking Number:</strong> ${order.tracking || 'Pending'}</p>
+        <p><strong>Track Here:</strong> ${trackingLink}</p>
+        <p>Estimated delivery: <strong>7-14 business days</strong></p>
+        <p>If you have any questions, reply to this email.</p>
+      `
+    };
+    await transporter.sendMail(mailOptions);
+    console.log(`Tracking email sent to ${order.customer.email}`);
+  } catch (error) {
+    console.error('Failed to send tracking email:', error);
+  }
+}
+
+// ============================================================
+//  START SERVER
+// ============================================================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Dropshipping backend running on port ${PORT}`);
+  console.log(`📧 Partner alerts will go to: ${CONFIG.email.alertTo}`);
+});
